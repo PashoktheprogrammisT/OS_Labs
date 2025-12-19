@@ -53,9 +53,6 @@ int main(int argc, char *argv[]) {
         
         remove_vowels(line);
         
-        printf("%s\n", line);
-        fflush(stdout);
-        
         fprintf(out, "%s\n", line);
         fflush(out);
     }
