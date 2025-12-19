@@ -2,59 +2,53 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <unistd.h>
-#include <ctype.h>
+#include <sys/wait.h>
 
 struct Shared {
     volatile sig_atomic_t ready;
     char buffer[1024];
 };
 
-volatile sig_atomic_t got_signal = 0;
-volatile sig_atomic_t terminate = 0;
+volatile sig_atomic_t child_done = 0;
 
-void sigusr1_handler(int sig) {
-    got_signal = 1;
+void sigusr2_handler(int sig) {
+    child_done = 1;
 }
 
-void sigterm_handler(int sig) {
-    terminate = 1;
-}
-
-int is_vowel(char c) {
-    c = tolower(c);
-    return (c == 'a' || c == 'e' || c == 'i' || 
-            c == 'o' || c == 'u' || c == 'y');
-}
-
-void remove_vowels(char *str) {
-    char *src = str, *dst = str;
-    while (*src) {
-        if (!is_vowel(*src)) {
-            *dst++ = *src;
-        }
-        src++;
+int main() {
+    char filename1[256], filename2[256];
+    
+    printf("Введите имя файла для child1: ");
+    fflush(stdout);
+    if (fgets(filename1, sizeof(filename1), stdin) == NULL) {
+        perror("Ошибка чтения имени файла 1");
+        return 1;
     }
-    *dst = '\0';
-}
-
-int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        fprintf(stderr, "Использование: %s shm_file output_file child_num\n", argv[0]);
+    filename1[strcspn(filename1, "\n")] = '\0';
+    
+    printf("Введите имя файла для child2: ");
+    fflush(stdout);
+    if (fgets(filename2, sizeof(filename2), stdin) == NULL) {
+        perror("Ошибка чтения имени файла 2");
+        return 1;
+    }
+    filename2[strcspn(filename2, "\n")] = '\0';
+    
+    char *shm_name = "shared_memory.dat";
+    int fd = open(shm_name, O_RDWR | O_CREAT | O_TRUNC, 0666);
+    if (fd == -1) {
+        perror("open");
         return 1;
     }
     
-    char *shm_name = argv[1];
-    char *output_name = argv[2];
-    int child_num = atoi(argv[3]);
-    
-    int fd = open(shm_name, O_RDWR);
-    if (fd == -1) {
-        perror("open");
+    if (ftruncate(fd, sizeof(struct Shared)) == -1) {
+        perror("ftruncate");
+        close(fd);
         return 1;
     }
     
@@ -67,54 +61,90 @@ int main(int argc, char *argv[]) {
     }
     
     close(fd);
+    shared->ready = 0;
     
-    struct sigaction sa_usr1, sa_term;
-    
-    sa_usr1.sa_handler = sigusr1_handler;
-    sigemptyset(&sa_usr1.sa_mask);
-    sa_usr1.sa_flags = 0;
-    sigaction(SIGUSR1, &sa_usr1, NULL);
-    
-    sa_term.sa_handler = sigterm_handler;
-    sigemptyset(&sa_term.sa_mask);
-    sa_term.sa_flags = 0;
-    sigaction(SIGTERM, &sa_term, NULL);
-    
-    FILE *out = fopen(output_name, "w");
-    if (!out) {
-        perror("fopen");
+    struct sigaction sa;
+    sa.sa_handler = sigusr2_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGUSR2, &sa, NULL) == -1) {
+        perror("sigaction");
         munmap(shared, sizeof(struct Shared));
         return 1;
     }
     
-    pid_t parent_pid = getppid();
-    
-    while (!terminate) {
-        pause();
-        
-        if (terminate) break;
-        if (!got_signal) continue;
-        got_signal = 0;
-        
-        if (shared->ready != child_num) continue;
-        
-        if (shared->ready == 0) {
-            break;
-        }
-        
-        char line[1024];
-        strncpy(line, shared->buffer, sizeof(line) - 1);
-        line[sizeof(line) - 1] = '\0';
-        
-        remove_vowels(line);
-        
-        fprintf(out, "%s\n", line);
-        fflush(out);
-        
-        kill(parent_pid, SIGUSR2);
+    pid_t pid1 = fork();
+    if (pid1 == 0) {
+        execl("./child", "child", shm_name, filename1, "1", NULL);
+        perror("execl child1");
+        exit(1);
     }
     
-    fclose(out);
+    pid_t pid2 = fork();
+    if (pid2 == 0) {
+        execl("./child", "child", shm_name, filename2, "2", NULL);
+        perror("execl child2");
+        exit(1);
+    }
+    
+    printf("\n=== Начало обработки строк ===\n");
+    printf("Вводите строки (Ctrl+D для завершения):\n");
+    printf("--------------------------------------\n");
+    
+    char line[1024];
+    long lineno = 0;
+    
+    while (fgets(line, sizeof(line), stdin)) {
+        lineno++;
+        
+        line[strcspn(line, "\n")] = 0;
+        
+        strncpy(shared->buffer, line, sizeof(shared->buffer) - 1);
+        shared->buffer[sizeof(shared->buffer) - 1] = '\0';
+        
+        if (lineno % 2 == 1) {
+            shared->ready = 1;
+            kill(pid1, SIGUSR1);
+        } else {
+            shared->ready = 2;
+            kill(pid2, SIGUSR1);
+        }
+        
+        while (!child_done) pause();
+        child_done = 0;
+        
+        printf("[%s] Строка %ld: %s\n", 
+               (lineno % 2 == 1) ? "child1" : "child2", 
+               lineno, line);
+    }
+    
+    printf("\n[INFO] Конец ввода\n");
+    printf("\n--------------------------------------\n");
+    printf("Ожидание завершения дочерних процессов...\n");
+    
+    shared->ready = 0;
+    kill(pid1, SIGTERM);
+    kill(pid2, SIGTERM);
+    
+    waitpid(pid1, NULL, 0);
+    waitpid(pid2, NULL, 0);
+    
+    printf("\n=== РЕЗУЛЬТАТЫ РАБОТЫ ===\n");
+    printf("child1 завершился с кодом: 0\n");
+    printf("child2 завершился с кодом: 0\n");
+    
+    char cmd[512];
+    printf("\n--- Содержимое %s ---\n", filename1);
+    snprintf(cmd, sizeof(cmd), "cat %s 2>/dev/null", filename1);
+    system(cmd);
+    
+    printf("\n--- Содержимое %s ---\n", filename2);
+    snprintf(cmd, sizeof(cmd), "cat %s 2>/dev/null", filename2);
+    system(cmd);
+    
     munmap(shared, sizeof(struct Shared));
+    unlink(shm_name);
+    
+    printf("\nРодительский процесс завершен.\n");
     return 0;
 }
