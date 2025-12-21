@@ -10,11 +10,18 @@
 #define SIZE 1024
 
 struct Data {
+    int child_ready[3];
     int for_child;
     int processed;
     int shutdown;
     char text[SIZE];
 };
+
+volatile sig_atomic_t child_done = 0;
+
+void sigusr2_handler(int sig) {
+    child_done = 1;
+}
 
 int main() {
     char file1[100], file2[100];
@@ -54,9 +61,16 @@ int main() {
     }
     close(fd);
     
+    for (int i = 0; i < 3; i++) data->child_ready[i] = 0;
     data->for_child = 0;
     data->processed = 1;
     data->shutdown = 0;
+    
+    struct sigaction sa;
+    sa.sa_handler = sigusr2_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGUSR2, &sa, NULL);
     
     pid_t p1 = fork();
     if (p1 == -1) {
@@ -87,7 +101,7 @@ int main() {
         exit(1);
     }
     
-    sleep(1);
+    while (data->child_ready[1] == 0 || data->child_ready[2] == 0) {}
     
     printf("\nВводите строки (Ctrl+D для завершения):\n");
     
@@ -99,7 +113,6 @@ int main() {
         line[strcspn(line, "\n")] = '\0';
         
         if (strlen(line) >= SIZE) {
-            printf("[WARNING] Строка слишком длинная, обрезана\n");
             line[SIZE-1] = '\0';
         }
         
@@ -107,31 +120,19 @@ int main() {
         data->for_child = (line_num % 2 == 1) ? 1 : 2;
         data->processed = 0;
         
-        int timeout = 0;
-        while (data->processed == 0 && timeout < 100) {
-            usleep(10000);
-            timeout++;
-        }
+        kill((line_num % 2 == 1) ? p1 : p2, SIGUSR1);
         
-        if (timeout >= 100) {
-            printf("[ERROR] Child не ответил, пропускаем строку\n");
-            data->processed = 1;
-        } else {
-            printf("[child%d] Обработана строка %d\n", 
-                   (line_num % 2 == 1) ? 1 : 2, line_num);
-        }
+        child_done = 0;
+        while (!child_done) {}
+        
+        printf("[child%d] Обработана строка %d\n", data->for_child, line_num);
     }
     
     printf("\nЗавершение работы...\n");
     
     data->shutdown = 1;
-    data->for_child = 1;
-    data->processed = 0;
-    sleep(1);
-    
-    data->for_child = 2;
-    data->processed = 0;
-    sleep(1);
+    kill(p1, SIGUSR1);
+    kill(p2, SIGUSR1);
     
     waitpid(p1, NULL, 0);
     waitpid(p2, NULL, 0);
@@ -150,6 +151,6 @@ int main() {
     munmap(data, sizeof(struct Data));
     unlink("lab3.dat");
     
-    printf("\nРабота завершена успешно.\n");
+    printf("\nРабота завершена.\n");
     return 0;
 }
