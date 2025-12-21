@@ -1,150 +1,155 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include <signal.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <signal.h>
 
-struct Shared {
-    volatile sig_atomic_t ready;
-    char buffer[1024];
+#define SIZE 1024
+
+struct Data {
+    int for_child;
+    int processed;
+    int shutdown;
+    char text[SIZE];
 };
 
-volatile sig_atomic_t child_done = 0;
-
-void sigusr2_handler(int sig) {
-    child_done = 1;
-}
-
 int main() {
-    char filename1[256], filename2[256];
+    char file1[100], file2[100];
     
     printf("Введите имя файла для child1: ");
-    fflush(stdout);
-    if (fgets(filename1, sizeof(filename1), stdin) == NULL) {
-        perror("Ошибка чтения имени файла 1");
+    if (fgets(file1, sizeof(file1), stdin) == NULL) {
+        perror("Ошибка чтения имени файла");
         return 1;
     }
-    filename1[strcspn(filename1, "\n")] = '\0';
+    file1[strcspn(file1, "\n")] = '\0';
     
     printf("Введите имя файла для child2: ");
-    fflush(stdout);
-    if (fgets(filename2, sizeof(filename2), stdin) == NULL) {
-        perror("Ошибка чтения имени файла 2");
+    if (fgets(file2, sizeof(file2), stdin) == NULL) {
+        perror("Ошибка чтения имени файла");
         return 1;
     }
-    filename2[strcspn(filename2, "\n")] = '\0';
+    file2[strcspn(file2, "\n")] = '\0';
     
-    char *shm_name = "shared_memory.dat";
-    int fd = open(shm_name, O_RDWR | O_CREAT | O_TRUNC, 0666);
+    int fd = open("lab3.dat", O_RDWR | O_CREAT | O_TRUNC, 0666);
     if (fd == -1) {
-        perror("open");
+        perror("Ошибка создания shared memory файла");
         return 1;
     }
     
-    if (ftruncate(fd, sizeof(struct Shared)) == -1) {
-        perror("ftruncate");
+    if (ftruncate(fd, sizeof(struct Data)) == -1) {
+        perror("Ошибка установки размера файла");
         close(fd);
         return 1;
     }
     
-    struct Shared *shared = mmap(NULL, sizeof(struct Shared),
-                                 PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (shared == MAP_FAILED) {
-        perror("mmap");
+    struct Data *data = mmap(NULL, sizeof(struct Data),
+                            PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) {
+        perror("Ошибка mmap");
         close(fd);
         return 1;
     }
-    
     close(fd);
-    shared->ready = 0;
     
-    struct sigaction sa;
-    sa.sa_handler = sigusr2_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    if (sigaction(SIGUSR2, &sa, NULL) == -1) {
-        perror("sigaction");
-        munmap(shared, sizeof(struct Shared));
+    data->for_child = 0;
+    data->processed = 1;
+    data->shutdown = 0;
+    
+    pid_t p1 = fork();
+    if (p1 == -1) {
+        perror("Ошибка fork для child1");
+        munmap(data, sizeof(struct Data));
+        unlink("lab3.dat");
         return 1;
     }
     
-    pid_t pid1 = fork();
-    if (pid1 == 0) {
-        execl("./child", "child", shm_name, filename1, "1", NULL);
-        perror("execl child1");
+    if (p1 == 0) {
+        execl("./child", "child", "1", file1, "lab3.dat", NULL);
+        perror("Ошибка execl для child1");
         exit(1);
     }
     
-    pid_t pid2 = fork();
-    if (pid2 == 0) {
-        execl("./child", "child", shm_name, filename2, "2", NULL);
-        perror("execl child2");
+    pid_t p2 = fork();
+    if (p2 == -1) {
+        perror("Ошибка fork для child2");
+        kill(p1, SIGTERM);
+        munmap(data, sizeof(struct Data));
+        unlink("lab3.dat");
+        return 1;
+    }
+    
+    if (p2 == 0) {
+        execl("./child", "child", "2", file2, "lab3.dat", NULL);
+        perror("Ошибка execl для child2");
         exit(1);
     }
     
-    printf("\n=== Начало обработки строк ===\n");
-    printf("Вводите строки (Ctrl+D для завершения):\n");
-    printf("--------------------------------------\n");
+    sleep(1);
     
-    char line[1024];
-    long lineno = 0;
+    printf("\nВводите строки (Ctrl+D для завершения):\n");
+    
+    char line[SIZE];
+    int line_num = 0;
     
     while (fgets(line, sizeof(line), stdin)) {
-        lineno++;
+        line_num++;
+        line[strcspn(line, "\n")] = '\0';
         
-        line[strcspn(line, "\n")] = 0;
-        
-        strncpy(shared->buffer, line, sizeof(shared->buffer) - 1);
-        shared->buffer[sizeof(shared->buffer) - 1] = '\0';
-        
-        if (lineno % 2 == 1) {
-            shared->ready = 1;
-            kill(pid1, SIGUSR1);
-        } else {
-            shared->ready = 2;
-            kill(pid2, SIGUSR1);
+        if (strlen(line) >= SIZE) {
+            printf("[WARNING] Строка слишком длинная, обрезана\n");
+            line[SIZE-1] = '\0';
         }
         
-        while (!child_done) pause();
-        child_done = 0;
+        strcpy(data->text, line);
+        data->for_child = (line_num % 2 == 1) ? 1 : 2;
+        data->processed = 0;
         
-        printf("[%s] Строка %ld: %s\n", 
-               (lineno % 2 == 1) ? "child1" : "child2", 
-               lineno, line);
+        int timeout = 0;
+        while (data->processed == 0 && timeout < 100) {
+            usleep(10000);
+            timeout++;
+        }
+        
+        if (timeout >= 100) {
+            printf("[ERROR] Child не ответил, пропускаем строку\n");
+            data->processed = 1;
+        } else {
+            printf("[child%d] Обработана строка %d\n", 
+                   (line_num % 2 == 1) ? 1 : 2, line_num);
+        }
     }
     
-    printf("\n[INFO] Конец ввода\n");
-    printf("\n--------------------------------------\n");
-    printf("Ожидание завершения дочерних процессов...\n");
+    printf("\nЗавершение работы...\n");
     
-    shared->ready = 0;
-    kill(pid1, SIGTERM);
-    kill(pid2, SIGTERM);
+    data->shutdown = 1;
+    data->for_child = 1;
+    data->processed = 0;
+    sleep(1);
     
-    waitpid(pid1, NULL, 0);
-    waitpid(pid2, NULL, 0);
+    data->for_child = 2;
+    data->processed = 0;
+    sleep(1);
     
-    printf("\n=== РЕЗУЛЬТАТЫ РАБОТЫ ===\n");
-    printf("child1 завершился с кодом: 0\n");
-    printf("child2 завершился с кодом: 0\n");
+    waitpid(p1, NULL, 0);
+    waitpid(p2, NULL, 0);
     
-    char cmd[512];
-    printf("\n--- Содержимое %s ---\n", filename1);
-    snprintf(cmd, sizeof(cmd), "cat %s 2>/dev/null", filename1);
+    printf("\n=== Результаты ===\n");
+    
+    printf("\nФайл %s:\n", file1);
+    char cmd[256];
+    sprintf(cmd, "cat %s 2>/dev/null || echo 'файл не найден'", file1);
     system(cmd);
     
-    printf("\n--- Содержимое %s ---\n", filename2);
-    snprintf(cmd, sizeof(cmd), "cat %s 2>/dev/null", filename2);
+    printf("\nФайл %s:\n", file2);
+    sprintf(cmd, "cat %s 2>/dev/null || echo 'файл не найден'", file2);
     system(cmd);
     
-    munmap(shared, sizeof(struct Shared));
-    unlink(shm_name);
+    munmap(data, sizeof(struct Data));
+    unlink("lab3.dat");
     
-    printf("\nРодительский процесс завершен.\n");
+    printf("\nРабота завершена успешно.\n");
     return 0;
 }
