@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include "scheduler.h"
@@ -110,8 +109,6 @@ void run_dag() {
     int started_jobs = 0;
 
     while (remaining > 0 && !global_error) {
-        int started = 0;
-        
         for (int i = 0; i < job_count; i++) {
             if (!jobs[i].completed && !running[i] && all_deps_completed(i)) {
                 pthread_mutex_lock(&dag_mutex);
@@ -123,15 +120,10 @@ void run_dag() {
                     started_jobs++;
                     pthread_create(&jobs[i].thread, NULL, job_thread, &jobs[i]);
                     pthread_detach(jobs[i].thread);
-                    started = 1;
                     printf("Launched job %s (%d/%d started)\n", 
                            jobs[i].name, started_jobs, job_count);
                 }
             }
-        }
-        
-        if (!started) {
-            usleep(100000);
         }
         
         for (int i = 0; i < job_count; i++) {
@@ -153,19 +145,13 @@ void run_dag() {
             pthread_mutex_unlock(&barriers[i].lock);
         }
         
-        int timeout = 50;
-        while (remaining > 0 && timeout-- > 0) {
-            usleep(100000);
+        while (remaining > 0) {
             for (int i = 0; i < job_count; i++) {
                 if (running[i] && jobs[i].completed) {
                     running[i] = 0;
                     remaining--;
                 }
             }
-        }
-        
-        if (remaining > 0) {
-            printf("Warning: %d jobs did not finish cleanly\n", remaining);
         }
     } else {
         printf("\n=== DAG COMPLETED SUCCESSFULLY ===\n");
